@@ -1,0 +1,242 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"},{"aliases":[],"languageName":"R","name":"Rkernel"}]}}
+
+#!csharp
+
+//https://irkernel.github.io/installation/
+#!connect jupyter --kernel-name Rkernel --kernel-spec ir
+
+#!Rkernel
+
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(naniar)
+library(lubridate)
+library(snakecase)
+library(gtsummary)
+library(broom)
+library(ggplot2)
+
+#!markdown
+
+## Generating BioRep numbers
+
+#!markdown
+
+Sometimes you may not have bioReps and observation counts in you input data. To automatically calculate these and remove proteoforms with too many missing values you can use the following code:
+
+#!Rkernel
+
+dataFile <- "\\\\resfiles.northwestern.edu\\krgData\\Projects\\2021 Hollas - QuantWorkups\\Steve_AlphaSyn\\Steve_alphSyn_fixedInput.csv"
+
+data <- read.csv(dataFile)
+data <- data[data$Treatment == "PD",]
+
+total <- nrow(data)
+
+data <- data %>%  group_by(Mass, Fraction)  %>%   
+           dplyr::mutate(bioRep = row_number()) # converts SampleID into BioReps (1-10 (ish) for each mass/FractionType)
+
+summary(data$bioRep)
+head(data)
+
+#!markdown
+
+Now we have bioRep numbers for each of the groups that we are comparing (FractionType here). 
+
+Next is to count how many observations we have in each group for each proteoform (or mass here).
+
+#!Rkernel
+
+counts <- data %>%  group_by(Mass, Fraction)  %>%   dplyr::summarize(counts = n()) # count how many measurements in each mass/Fraction
+
+maxCounts <- counts %>%  group_by(Fraction)  %>%   dplyr::summarize(max = max(counts)) # get the maximum number of observations for each Fraction 
+                                                                                       # (we are assuming that at lease 1 proteoform is seen in all runs)
+counts <- merge(counts, maxCounts)
+data <- merge(data, counts)
+
+summary(data$max)
+summary(data$counts)
+
+#!markdown
+
+Now we will filter the data that have `< max/2` observations for a given proteoform in a given Fraction.
+
+#!Rkernel
+
+data <-  subset(data, counts>=max/2)
+
+#!markdown
+
+Next we'll remove proteoforms that are now only in one Fraction (as we can't actually compare them)
+
+#!Rkernel
+
+tooFew <- data %>%  group_by(Mass) %>% dplyr::summarize(groupCount = n_distinct(Fraction)) # count how many distinct group
+data <- merge(data, tooFew)
+data <-  subset(data, groupCount > 1 )
+names(data)
+data[1:3,]
+
+#!Rkernel
+
+missing <- (1 -(nrow(data)/total))*100
+sprintf("Missing Values: %4f %% ", missing)
+
+#!markdown
+
+## Visualizing missing values
+
+#!markdown
+
+In order to visualize missing values we need to create the wide version of the table (i.e. PFR as rows and samples as columns).
+
+#!Rkernel
+
+data_wide <- data |> 
+  pivot_wider(id_cols = Mass, 
+    names_from = c(Treatment, Fraction, bioRep), values_from = Intensity)
+
+head(data_wide)
+
+#!Rkernel
+
+data_wide |> dplyr::select(-Mass) |> 
+naniar::vis_miss()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, 
+    size = 7, hjust = 1))
+
+#!markdown
+
+# Filtering Missing Values
+
+#!markdown
+
+Some times we have study desings where the number of samples per biological condition (e.g. Treatment) is different. In those cases perhaps is convinient to filter missing values so that we accept an especific % of missing value per condition, or in at least one condition. The following function allows to filter missing values in a more flexible way.
+
+#!Rkernel
+
+# @param df = data frame containing LOG2 data for filtering and organized by data type
+# @param conditions = a character vector dictating the grouping
+# @param percent_accepted = percent of valid values we want to keep in each condition (or in at least one condition). 
+# @param at_least_one = TRUE means to keep the row if percent_accepted is met for at least one condition FALSE means percent_accepted must be met across all conditions for retention
+
+# @return 'df' data frame with additional columns: column 'KEEP'(filled with TRUE and FALSE where FALSE indicates which protein should be excluded), other columns: contain number of valid values per group of samples
+
+# @examples
+# data(data_wide)
+# data_wide1 <- data_wide |> dplyr::select(-Mass) |> 
+#               filter_missValues(conditions = c("pellet","Soluble"), percent_accepted = 50, at_least_one = TRUE))
+
+
+filter_missValues = function(df, conditions, percent_accepted = 30, at_least_one = FALSE) {
+  
+  df.names <- names(df)
+  cond.names = lapply(conditions, function(x) grep(x, df.names, value = TRUE, perl = TRUE))
+  cond.validV <- numeric()
+  
+  for(i in 1:length(cond.names))
+  {
+    df_cond <- df[,cond.names[[i]]]
+    cond.validV[i] <-  round((percent_accepted * ncol(df_cond))/100,0)
+  }
+  names(cond.names) <- conditions
+  
+  cond.filter = sapply(1:length(cond.names), function(i) 
+  {
+    df2 = df[,cond.names[[i]]]     # Extract columns of interest
+    df2 = as.matrix(df2)           # Cast as matrix for the following command
+    sums = rowSums(is.finite(df2)) # count the number of valid values for each condition
+    sums >= cond.validV[i]         # Calculates whether cond.validV requirement is met
+  })
+  values.count = sapply(1:length(cond.names), function(i) 
+  {
+    df2 = df[cond.names[[i]]]       # Extract columns of interest
+    df2 = as.matrix(df2)            # Cast as matrix for the following command
+    sums = rowSums(is.finite(df2))  # count the number of valid values for each condition
+  })
+  colnames(values.count) <- conditions
+  
+  if (at_least_one) {df$KEEP = apply(cond.filter, 1, any)} else {df$KEEP = apply(cond.filter, 1, all)}
+  
+  df <- cbind(df,values.count)
+  return(df)                        # No rows are omitted, filter rules are listed in the KEEP column
+}
+
+#!markdown
+
+### Executing 'filter_missValues' function
+
+#!markdown
+
+We need to create the wide version of the table (i.e. PFR as rows and samples as columns).
+
+#!Rkernel
+
+data_wide <- data |> 
+  pivot_wider(id_cols = Mass, 
+    names_from = c(Treatment, Fraction, bioRep), values_from = Intensity)
+
+#!markdown
+
+Here we can see several examples of filtering with 'filter_missValues' function:
+
+#!Rkernel
+
+levels(as.factor(data$Fraction))           # looking for the names of the biological conditions
+
+# Accepting at least 50% of valid values in at least one condition 
+data_wide1 <- data_wide |> dplyr::select(-Mass) |> 
+              filter_missValues(conditions = c("pellet","Soluble"), percent_accepted = 50, at_least_one = TRUE)
+
+data_wide1 <- data_wide1|> filter(KEEP != FALSE)
+
+# Accepting at least 70% of valid values in at least one condition 
+data_wide2 <- data_wide |> dplyr::select(-Mass) |> 
+              filter_missValues(conditions = c("pellet","Soluble"), percent_accepted = 70, at_least_one = TRUE)
+
+data_wide2 <- data_wide2|> filter(KEEP != FALSE)
+
+# Accepting at least 70% of valid values in all conditions 
+data_wide3 <- data_wide |> dplyr::select(-Mass) |> 
+              filter_missValues(conditions = c("pellet","Soluble"), percent_accepted = 70, at_least_one = FALSE)
+
+data_wide3 <- data_wide3|> filter(KEEP != FALSE)
+
+paste0("Number of PFR before filtering: ", nrow(data_wide))
+paste0("Number of PFR after keeping at least 50% of valid values in at least one condition = ", nrow(data_wide1))
+paste0("Number of PFR after keeping at least 70% of valid values in at least one condition = ", nrow(data_wide2))
+paste0("Number of PFR after keeping at least 70% of valid values in all conditions = ", nrow(data_wide3))
+
+
+head(data_wide2[, ncol(data_wide):ncol(data_wide2)])
+
+#!markdown
+
+**Finally we need to put the table back to the long format**
+
+Lets repeat the filtering that accept 50% of valid values in at least one condition and create back the long-format table. 
+
+#!Rkernel
+
+# Accepting 50% of valid values in at least one condition 
+data_wide2 <- data_wide |> dplyr::select(-Mass) |> 
+              filter_missValues(conditions = c("pellet","Soluble"), percent_accepted = 50, at_least_one = TRUE)
+            
+data_wide2 <- cbind(data_wide, data_wide2 |> select(KEEP, levels(as.factor(data$Fraction))))|> 
+              filter(KEEP != FALSE)|> select(-KEEP)         
+
+#!Rkernel
+
+# Long table
+data_long <- data_wide2 |>
+             reshape2::melt(id.vars = c("Mass", levels(as.factor(data$Fraction))))|>
+             separate(variable, into = c("Treatment", "Fraction",'bioRep'), sep = "_")|>
+             mutate(Intensity = value)|> select(-value)|> na.omit()
+
+data_long <- merge(data_long, data |> select(Mass,Treatment, Fraction, bioRep, Day, RunNum), 
+                    by.y = c('Mass','Treatment', 'Fraction', 'bioRep'), 
+                    by.x = c('Mass','Treatment', 'Fraction', 'bioRep'))
+head(data_long)

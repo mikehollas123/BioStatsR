@@ -1,0 +1,123 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"},{"aliases":[],"languageName":"R","name":"Rkernel"}]}}
+
+#!csharp
+
+//https://irkernel.github.io/installation/
+#!connect jupyter --kernel-name Rkernel --kernel-spec ir
+
+#!Rkernel
+
+library(lme4)
+library(doBy)
+library(multcomp)
+library(ggplot2)
+
+#!markdown
+
+"Power is defined as 1−β, where β is the false-negative rate. This refers to the probability that the result is a false negative, also known as a Type II error. In the initial experimental design stage, a power analysis can be used to calculate the minimum number of samples (biological replicates) required for a study, such that the results are likely to be reproducible in a validation stage." - https://analyticalsciencejournals.onlinelibrary.wiley.com/doi/10.1002/pmic.201100033
+
+#!markdown
+
+For our quant pipelines, power curves are useful for determining the required bioReps (n) in order to have a good chance to observe a differential expression with a given expected effect size. This is typically achieved by simulating a data set, using % Covariance values previously determined from a prior pilot study IN THE SAME SYSTEM! (Same tissue type, same mass spec technique, same sample processing). This is done using % Cov for all types of variation in z scores, and is typically one of the outputs from our MLM quant analysis. Typically you would use the average of the % Cov of each variation type. However, this would depend on the question you're trying to answer with the power curve. For example, you may want to try and observe a proteoform with expected high level of technical variation and want to know how many tech reps you should use. Here you would set the 'var_tech' to be the third quartile (75th percentile). 
+
+#!markdown
+
+The objective is to run simulations with a variety of different effect sizes and bioreps (or techReps) and measure the 'Power' (simply the % of simulations that pass the hypotheis test you are doing) and plot the results.
+
+#!Rkernel
+
+# This fuction Runs a single simulation and calculates the power.
+SimulateAndCalculate <- function(nSims, treatment_eff, nsubject, var_subject, tech_cnt, var_tech, var_resid)
+  {
+  simData <- data.frame(matrix(ncol = 5, nrow = 0))
+  colnames(simData) <- c("Sim","Treatment","Subject","Tech","Intensity")
+  for (sim in 1:nSims)
+  {
+    for (subject in 1:nsubject)
+      {
+      u_subject <- sqrt(var_subject) * rnorm(1) # create simulated data using a random value from a normal distribution 
+      
+      for(tech in 1:tech_cnt)
+        {
+        u_tech <- sqrt(var_tech) * rnorm(1)
+        u_res <- sqrt(var_resid) * rnorm(1)
+        intensity <- u_subject + u_tech + u_res ; # Combine all our variation values into an intensity
+        
+        simData[nrow(simData) + 1,] <-  list(sim,"control",subject,tech,intensity) # We simulate both control and the Treatment datasets
+        
+      }
+      
+      for(tech in 1:tech_cnt)
+      {
+        u_tech <- sqrt(var_tech) * rnorm(1)
+        u_res <- sqrt(var_resid) * rnorm(1)
+        intensity <- treatment_eff + u_subject + u_tech + u_res ; # These values are all in zScore
+        
+       simData[nrow(simData) + 1,] <- list(sim,"Treatment",subject,tech,intensity)
+      }
+    }
+  }
+  pValues <- data.frame(matrix(ncol = 2, nrow = 0))
+  colnames(pValues) <- c("Sim","p.Value")
+  
+  for (sim in unique(simData$Sim))
+  {
+    filtered <- simData[simData$Sim == sim,]
+  
+  model <- suppressWarnings(suppressMessages(lmer("Intensity ~ Treatment -1 + (1|Subject) + (1|Tech) ", data=filtered))) # this should match the model you're using!
+  
+  pValue <- linest(model, L=glht(model, mcp(Treatment="Tukey"))$linfct)$coef[c("p.value")][1,1] # Get the Treatment p value
+    
+  pValues[nrow(pValues) + 1,] <- c(sim,pValue)
+  }
+  
+  power <- nrow(pValues[pValues$p.Value < 0.05,]) / nrow(pValues) # Power is the ratio of passing tests to total tests
+  return(power)
+}
+
+
+# This fuction loops over a given number of effect sizes
+PowerCalc <- function(nSims, mnsubject, mvar_subject, mtech_cnt, mvar_tech, mvar_resid)
+  {
+  PowerData <- data.frame(matrix(ncol = 3, nrow = 0))
+  colnames(PowerData) <- c("n","effectSize","Power")
+  
+  for(i in 1:10) # loop over different effect sizes (all in zScore)
+    {
+        k <- 0.25 * i # the effect size
+        pow <- SimulateAndCalculate(nSims, k, mnsubject, mvar_subject, mtech_cnt, mvar_tech, mvar_resid)
+        PowerData[nrow(PowerData) +1,] <- list(mnsubject,k,pow)  
+    }
+  
+  return(PowerData)
+}
+
+#!Rkernel
+
+PowerData <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(PowerData) <- c("n","effectSize","Power")
+
+nSims <- 50 # should be higher (but this can be slow, so for this demo...) 1000 is a good number!
+
+for (n in 3:7) # loop over the number of bioReps. What you use will depend on the study you're doing.
+  {
+  p <- PowerCalc(nSims,n,0.25,3,0.10,0.65) # Here is where you change the number of tech reps and the % Cov values for the system.
+  PowerData = rbind(PowerData,p)
+}
+
+#!markdown
+
+This can be quite slow (that's R for you!). Once you have your data you can plot your power curves. 
+
+Typically, you plot x=EffectSize y=Power and look at the curves around 80% power (the red line). You use these curves to try and determine a cost analysis for future experiments. You can observe the expected returns for a higher N for a study.
+
+These curves don't look great (the number of simulations is low), in practice you should use a large enough number of simulations to smooth out the curves (>1000).
+
+#!Rkernel
+
+ggplot(PowerData, aes(x=effectSize, y=Power, colour=factor(n))) +
+  geom_line()+
+  geom_point()+
+    geom_hline(yintercept=0.8, col="red")

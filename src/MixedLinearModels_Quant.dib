@@ -1,0 +1,471 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"name":"csharp"},{"aliases":[],"languageName":"R","name":"Rkernel"}]}}
+
+#!csharp
+
+//https://irkernel.github.io/installation/
+#!connect jupyter --kernel-name Rkernel --kernel-spec ir
+
+#!Rkernel
+
+library(lme4)
+library(doBy)
+library(multcomp)
+library(stringr)
+library(ggplot2)
+library(ggpubr)
+library(plyr)
+library(dplyr)
+
+#!markdown
+
+## Mixed Linear Models
+
+Mixed Linear Models allow for the modeling of fixed and random effects and are particularly useful for hierarchical structures in the study design (i.e., Tech Reps and Bio Reps). Fixed effects are variables that you are testing to see if there is a difference between. (i.e., Treatment, Time, Sex, Blocks ...). Random effects are variables that are expected to be randomly distributed with a mean of 0 (i.e., natural variation between subjects). 
+
+Here's a good source for this: https://stats.oarc.ucla.edu/other/mult-pkg/introduction-to-linear-mixed-models/
+
+#!markdown
+
+### Fixed and Random Effects
+
+These variables are usually represented as an equation, and in the `lmer` function in the `lme4` R package are represented like this:
+
+    `"Y ~ FixedEffect1 + FixedEffect2 + (1|RandomEffect)"`
+
+Where Y is the outcome value (typically normalized Intensity). This model also fits an intercept, which can be removed by placing a -1 before the random effects:
+
+    `"Y ~ FixedEffect1 + FixedEffect2 -1 + (1|RandomEffect)"`
+
+#!markdown
+
+### Nested Random Effects
+
+This is mostly taken from here: https://www.muscardinus.be/2017/07/lme4-random-effects/
+
+When there is a hierarchy in the grouping of the observations, (i.e., Tech Reps within Bio Reps) nesting can be used to utilize all the data in a dataset. Traditional proteomics flattens technical reps into BioRep (i.e., means, medians) and then uses classical Hypothesis testing. This does work, but doesn't leverage all the data, and can be more sensitive to outliers and missing values. 
+
+In `lmer` nesting can be signified in two ways:
+
+1. Explicit Nesting
+    Each hierarchical level is explicitly described. e.g.
+
+    `"Y ~ Treatment -1 + (1|BioRep) + (1|BioRep:TechRep)"`
+
+    Here, TechReps are nested within BioReps. With explicit notation the order is not important. The following equation will give the same nesting structure.
+
+    `"Y ~ Treatment -1 + (1|TechRep:BioRep) + (1|BioRep) "`
+
+2. Shorthand nesting
+    `(1|BioRep) + (1|BioRep:TechRep)` can be shortened to `(1|BioRep/TechRep)`. However, the order is important, and could lead to confusion. 
+
+    `(1|BioRep/TechRep)` => `(1|BioRep) + (1|BioRep:TechRep)`
+
+    but
+
+    `(1|TechRep/BioRep)` => `(1|TechRep) + (1|TechRep:BioRep)`
+
+    These will yield different hierarchical structures. Due to this, it is best practice to stick to explicit nesting.
+
+#### More than 2 Levels
+
+Nesting can be expanded to more than 2 levels like this:
+
+`(1|A) + (1|A:B) + (1|A:B:C) + (1|A:B:C:D)`
+
+Therefore, if for a proteomics experiment with BioReps, a true technical rep (e.g., a separate IP pulldown, sample processing on the same patient sample), and injection replicates would look like this:
+
+`(1|BioRep) + (1|BioRep:TechRep) + (1|BioRep:TechRep:InjRep)`
+
+#!markdown
+
+## MLM in Proteomics
+
+#!markdown
+
+This section will focus more on how to do the TopDown label free Quant using MLMs.
+
+For this example, we will use a dataset that has been generated using TDPortal, what is typically known as the SAS input sheet. 
+
+Load the data like this:
+
+#!Rkernel
+
+datafile <- "\\\\resfiles.northwestern.edu\\krgData\\Projects\\2021 Hollas - QuantWorkups\\Rafa - Mellisa\\Galaxy120-Quant_SAS_Input.csv"
+data <- read.table(datafile, header=T, sep=",")
+
+head(data)
+
+#!markdown
+
+This sheet contains a row for each observation (a measurement of a single proteoform in a single raw file), with information about the proteoform, the level information, the raw and TIC normalized intensities. Here are some notable columns:
+
+|Column|Description|
+| :--- |:----     |
+|`PFR`| Proteoform Record Number - a unique identifier for a proteoform|
+|`Search_QValue`|The QValue reported in the TDreport for a proteoform. I.e. How confident are we that we identified this proteoform|
+|`XXX_Count`|The count columns are automatically generated and report how many raw files contain an observation of this proteoform within a given Treatment group. These are used for missing value calculation and data filtering|
+|`Treatment`|The treatment level for this observation. This is typically the variable that we want to measure differences between|
+|`BioRep`|The BioRep level for this observation. For each treatment these should number from 1-n. This is required for the bioreps to group together|
+|`TechRep`|The TechRep level for this observation. For each BioRep these should number from 1-n|
+|`IntensityNotNormalized`|The un-normalized intensity of the proteoform - typically not used|
+|`Intensity`|The value of the observation, which is used as the output variable in the MLM. The TIC normalized intensity of the proteoform|
+
+#!markdown
+
+Next, we need to transform the data into log2 space, and then z score normalizing within each PFR.
+
+#!Rkernel
+
+data['Log2Y'] <- log(data$Intensity,2)
+
+#Zscore Normalize for each PFR
+data<- ddply(data, c("PFR"), transform, zScore = scale(Log2Y))
+
+#!markdown
+
+### Determining Missing Values
+
+#!markdown
+
+This code should automatically remove any columns that have 50% or fewer datapoints in a given treatment. For more complex designs, it's probably better to write something more manual.
+
+#!Rkernel
+
+total <- nrow(data)
+
+# get all the count columns and loop over them
+CountColumns <- data %>% dplyr:: select(ends_with("_Count")) %>% colnames()
+
+for (i in CountColumns)
+{
+    maxCount <- max(data[[i]])
+    t <- str_split(i,"_")[[1]][[1]]
+    # filter by treatment for this count column and keep rows with Counts > 50% of the max.
+    data <- data %>% dplyr::filter( Treatment != t | !!as.symbol(i) > maxCount/2)
+}
+
+# This will remove PFRs that are only in 1 treatment after filtering
+tooFew <- data %>%  group_by(PFR) %>%   dplyr::summarize(groupCount = n_distinct(Treatment)) # count how many distinct group
+
+data <- merge(data, tooFew)
+data <-  subset(data, groupCount > 1 )
+
+missing <- (1 -(nrow(data)/total))*100
+sprintf("Missing Values: %4f %% ", missing)
+
+#!markdown
+
+The MLM system is pretty tolerant of missing values, and TD proteomics generally produces very few. The missing value % should be below 5-10%.
+
+#!markdown
+
+### Investigating Variation From All Sources
+
+#!markdown
+
+A good first level validation for a dataset is to look at the variation from each souce. This can be done by treating all effects as random effects
+
+  `"Y ~ -1 (1|Treatment) + (1|BioRep) + (1|BioRep:TechRep)"`
+
+#!Rkernel
+
+CovAll <- data.frame( grp = numeric(), vcov = numeric())
+
+for (pfr in unique(data$PFR))
+{
+model1 <- lmer("zScore ~ -1 + (1|Treatment) + (1|TechRep) + (1|BioRep)", data=data[data$PFR == pfr,])
+
+covData <- as.data.frame(VarCorr(model1))
+covData["PFR"] = pfr
+covData$percent <- 100*covData$vcov / sum(covData$vcov)
+CovAll <- rbind(CovAll,covData[,c("PFR","grp","percent")])
+}
+
+#!Rkernel
+
+boxplot(percent~grp,
+        data=CovAll,
+        main="Percent Variation Explained by All Sources",
+        xlab="Source",
+        ylab="Percent")
+
+#!markdown
+
+The variation plot gives you a snapshot of the quality of the data. The residual should be the highest, BioRep should be larger than TechRep, and if you're expecting big differences, Treatment should be larger than tech reps. If TechReps are unusually high, that might mean that there was an issue with data acquistion. If BioReps are extremely high, and the data acquisition was done over multiple days/weeks, there may be a batch effect, which needs to be corrected for. 
+
+#!markdown
+
+### Batch Correction
+
+#!Rkernel
+
+batchEffectfile <- "\\\\resfiles.northwestern.edu\\krgData\\Projects\\2021 Hollas - QuantWorkups\\Vijii - LiverCirrhosis\\10Blocks\\quantSASInput_QualFirst_blocksFixed.csv"
+bdata <- read.table(batchEffectfile, header=T, sep=",")
+
+bdata['Log2Y'] <- log(bdata$Intensity,2)
+bdata<- ddply(bdata, c("PFR"), transform, zScore = scale(Log2Y))
+
+bCountColumns <- bdata %>% dplyr:: select(ends_with("_Count")) %>% colnames()
+
+for (i in bCountColumns)
+{
+    maxCount <- max(bdata[[i]])
+    t <- str_split(i,"_")[[1]][[1]]
+    bdata <- bdata %>% dplyr::filter( Treatment != t | !!as.symbol(i) > maxCount/2)
+}
+
+tooFew <- bdata %>%  group_by(PFR) %>%   dplyr::summarize(groupCount = n_distinct(Treatment)) # count how many distinct group
+bdata <- merge(bdata, tooFew)
+bdata <-  subset(bdata, groupCount > 1 )
+
+bCovAll <- data.frame( grp = numeric(), vcov = numeric())
+
+for (pfr in unique(bdata$PFR)[1:1000])
+{
+model1 <- lmer("zScore ~ -1 + (1|Treatment) + (1|TechRep) + (1|BioRep)", data=bdata[bdata$PFR == pfr,])
+
+covData <- as.data.frame(VarCorr(model1))
+covData["PFR"] = pfr
+covData$percent <- 100*covData$vcov / sum(covData$vcov)
+bCovAll <- rbind(bCovAll,covData[,c("PFR","grp","percent")])
+}
+
+#!Rkernel
+
+boxplot(percent~grp,
+        data=bCovAll,
+        main="Percent Variation Explained by All Sources",
+        xlab="Source",
+        ylab="Percent")
+
+#!markdown
+
+As you can see, in this dataset the variance for BioReps seems higher than expected. Let's add a random effect for Block (the day it was run)
+
+#!Rkernel
+
+bCovAll <- data.frame( grp = numeric(), vcov = numeric())
+
+for (pfr in unique(bdata$PFR)[1:1000])
+{
+model1 <- suppressMessages(lmer("zScore ~ -1 + (1|Treatment) + (1|TechRep)+ (1|Block) + (1|BioRep)", data=bdata[bdata$PFR == pfr,]))
+
+covData <- as.data.frame(VarCorr(model1))
+covData["PFR"] = pfr
+covData$percent <- 100*covData$vcov / sum(covData$vcov)
+bCovAll <- rbind(bCovAll,covData[,c("PFR","grp","percent")])
+}
+
+#!Rkernel
+
+boxplot(percent~grp,
+        data=bCovAll,
+        main="Percent Variation Explained by All Sources",
+        xlab="Source",
+        ylab="Percent")
+
+#!markdown
+
+As we can see, there does appear to be a block effect. for this dataset we will add Block as a random effect in our models.
+
+#!markdown
+
+### Getting P-Values and fold changes
+
+#!markdown
+
+Going back to the original dataset; now we get to the creation of volcano plots. For volcano plots we need to have p values and fold changes (or fold expression for z scores). 
+To do this, we use two MLMs:
+1. uses zScore as the outcome variable. This will give us our pvalues with the most power. This also can give us the estimates of the mean for heatmaps.
+2. Uses Log2(Intensity) as the outcome variable. This has less power, but people like to see fold change in the orginal units.
+
+#!Rkernel
+
+# Create the output data frame.
+pValues <- data.frame(matrix(ncol = 7, nrow = 0))
+colnames(pValues) <- c("PFR","Treatment","_Treatment","p.value","estimate","std.error","fold")
+
+# one test per proteoform
+for (pfr in unique(data$PFR)[1:100]) #limited to 100 PFRs just for demonstration purposes
+{
+   # 1st Linear Model, this will get the p Values from the z score normalized data (this gives better statistical power)
+  model2 <- suppressMessages(lmer("zScore ~ Treatment -1 + (1|BioRep) + (1|BioRep:TechRep)", data=data[data$PFR == pfr,]))
+
+  # This gives the Diffs of LSMs. using Tukey multiple comparisons. We could use different ways if the data called for it. 
+  # If you have multiple treatments (Fixed effects) you will need to do this for each one
+  diffs1 <- linest(model2, L=glht(model2, mcp(Treatment="Tukey"))$linfct)$coef[c("p.value")] # Get just the p Value for now
+  diffs1[c('Treatment', '_Treatment')] <- str_split_fixed(rownames(diffs1), ' - ', 2) # just a formatting fix for merging
+  diffs1["PFR"] = pfr
+  
+
+  # 2nd Linear Model, this will get the fold changes in log2 (not z Scores, people like to see fold change, not differences in z Score)
+  model3 <- suppressMessages(lmer("Log2Y ~ Treatment -1 + (1|BioRep) + (1|BioRep:TechRep) ", data=data[data$PFR == pfr,]))
+  diffs2 <- linest(model3, L=glht(model3, mcp(Treatment="Tukey"))$linfct)$coef[c("estimate","std.error")] # Get the estimates of the differences in means.
+  diffs2[c('Treatment', '_Treatment')] <- str_split_fixed(rownames(diffs2), ' - ', 2)
+  diffs2["PFR"] = pfr
+  
+  merged <- merge(diffs1,diffs2,c("PFR","Treatment","_Treatment"))  # merge the two dataframes together
+  
+  merged["fold"] <- 2**merged$estimate # convert the estimate into fold change (we don't HAVE to do this for volcano plots, but it's human readable)
+  
+  pValues <- rbind(pValues,merged)  # Add a new row to the output dataframe.
+}
+
+head(pValues)
+
+#!markdown
+
+Now we have most of the information we need to create vocalno plots (infact we can plot them with p values, but that would be WRONG!!!). Next we need to correct for multiple testing.
+
+We typcially use the Benjamini Hochberg procedure. This yields corrected p-values, typically known as q-values.
+https://www.jstor.org/stable/2346101
+
+#!Rkernel
+
+pValues <- pValues[order(pValues$p.value),]
+pValues["qValue"] <- p.adjust(pValues$p.value, method = "BH")
+head(pValues)
+
+#!markdown
+
+Once we have our q-values, we can now generate our volcano plots.
+
+These are pairwise comparison plots between the treatments, so you should filter the rows to only contain the effect pair that you're looking at.
+
+Volcano plots are scatter plots with `x = log2(fold)` and `y = -log10(q-value)`. Typically lines are drawn to mark boundries for significance. Typically q values > 0.05 (5% FDR), and fold changed > 1 or < -1.
+
+Here is an example of how to plot all possible volcano plots using the data above:
+
+#!Rkernel
+
+ comps <- unique(pValues %>% dplyr:: select(c('Treatment','_Treatment')))
+
+ volcanoPlot <- function(A,B, data)
+{
+AvB <- data[data$Treatment== A & data["_Treatment"] == B ,]
+
+    AvB$diffexpressed <- "NO"
+    AvB$delabel <- NA
+
+    AvB$diffexpressed[log2(AvB$fold) > 0.6 & AvB$qValue < 0.05 ] <- "Up"
+    AvB$diffexpressed[log2(AvB$fold) < -0.6 & AvB$qValue < 0.05 ] <- "Down"
+
+    #AvB$delabel[AvB$diffexpressed != "NO"] <- AvB$Accession[AvB$diffexpressed != "NO"]
+
+    mycolors <- c("blue", "red", "gray")
+    names(mycolors) <- c("Down", "Up", "NO")
+
+    p <-ggplot(data=AvB, aes(x=log2(fold), y=-log10(qValue), col=diffexpressed, label=delabel)) + 
+    geom_point() +  
+    theme_minimal()+
+    ggtitle(sprintf("%s vs %s",A,B)) +
+    xlab("log2(fold change)") + ylab("-log10(q value)") +
+    
+    
+    theme(plot.title = element_text(size=18, face="bold", hjust=0.5)) +
+    theme(axis.title.x = element_text( size=14, face="bold")) +
+    theme(axis.title.y = element_text( size=14, face="bold")) +
+    theme(axis.text.x = element_text( size=14)) +
+    theme(axis.text.y = element_text( size=14)) +
+    theme(legend.position = "none") +
+    geom_vline(xintercept=c(-0.6, 0.6), col="red") +
+    geom_hline(yintercept=-log10(0.05), col="red") +
+    scale_colour_manual(values = mycolors)
+
+    return(p)
+}
+plots <- list()
+for (i in 1:nrow(comps))
+{
+    plots[[i]] <- volcanoPlot(comps[i,"Treatment"],comps[i,"_Treatment"], pValues)
+}
+
+plots
+
+#!markdown
+
+In this case there are only two possible levels of treatment, so only one comparison. A volcano plot shows proteoforms that are in the UP regulated in B region (red) and Downregulated in B (blue). Where A == Treatment and B == _Treatment. it's possible to add labels in ggplots, but this can get overwhelming quickly and is outside of the scope of this tutorial.
+
+#!markdown
+
+### Heatmaps
+
+#!markdown
+
+Heatmaps can be a very useful tool in displaying the differences in all treatments in a glance. Typically they are mose useful with a subset of proteoforms, maybe those that are of interest, or of a particular protein.
+
+#!Rkernel
+
+# We will have an estimate of the mean and std error for each treatment level, but this will vary in each experiment. So first we dynamically generate our output dataframe.
+TreatmentLevels <- unique(data$Treatment)
+heatmap <- data.frame(matrix(ncol = length(TreatmentLevels)*2 + 1, nrow = 0)) # 2 columns per treatment + PFR number/any label we want.
+
+
+# one test per proteoform
+for (pfr in unique(data$PFR)[1:100]) #limited to 100 PFRs just for demonstration purposes
+{
+   # 1st Linear Model, this will get the p Values from the z score normalized data (this gives better statistical power)
+    model2 <- suppressMessages(lmer("zScore ~ Treatment -1 + (1|TechRep) + (1|BioRep)", data=data[data$PFR == pfr,]))
+
+    # use the LSmeans fucntion to get the least squares fitted means for each treatment.
+    lsm <- LSmeans(model2, effect="Treatment")$coef
+    row.names(lsm) <- LSmeans(model2, effect="Treatment")$grid$Treatment
+
+    # we need to get this into a format that works with the output dataframe, and to make sure that they line up.
+    estimates <- list(pfr)
+    for(treatment in TreatmentLevels){
+        estimates <- append(estimates,lsm[treatment,"estimate"])
+        estimates <- append(estimates,lsm[treatment,"std.error"])
+    }
+  heatmap <- rbind(heatmap,estimates) # add to the output df
+  
+}
+
+# right now the column names are all wrong! now we fix that. these need to be in the same order as above, so looping over TreatmentLevels  should enforce that.
+titles <- list("PFR")
+for(treatment in TreatmentLevels)
+  {
+  titles <- append(titles,sprintf("%s_estimateZ",treatment))
+  titles <- append(titles,sprintf("%s_Std.ErrorZ",treatment))
+}
+colnames(heatmap) <- titles
+
+#!markdown
+
+Now, we are able to plot our heatmaps. You can filter by PFR, which may not be that useful. Best practice is to calculate all these values in one loop, and generate a single dataframe, which we can merge with the metadata. See below.
+
+#!Rkernel
+
+library("gplots") # there is a heatmap in ggplots2, I don't know which is better. 
+heatmapdata <- t(data.matrix(heatmap %>% dplyr::select(ends_with("_estimateZ"))))
+my_palette <- colorRampPalette(c("blue", "white", "red"))(n = 299)
+
+heatmap.2(heatmapdata,scale="none", 
+          col=my_palette,   
+          trace="none",
+          density.info = "none",
+          key=TRUE, 
+          xlab="Proteoforms",
+          margins = c(5, 10),
+          cexRow = 1.2,
+          cexCol = 0.8)
+
+#!markdown
+
+This code will merge our pvalues/qvalues table with the heatmaps and with all the meta data from the original data frame. 
+
+We can then use this to generate an output sheet to give to collaborators, and use to generate specific heatmaps or further analysis.
+
+#!Rkernel
+
+metaData <- unique(data %>% dplyr::select(c("PFR":"TargetMass","Accession":"Search_Qvalue")))
+
+finalData <- merge(pValues,metaData, c("PFR"))
+finalData <- merge(finalData,heatmap, c("PFR"))
+
+head(finalData)
+
+## Now lets export the data. In future we may want to clean this up a little.
+write.csv(finalData, "\\\\resfiles.northwestern.edu\\krgData\\Projects\\2021 Hollas - QuantWorkups\\Rafa - Mellisa\\rTestOutput.csv", row.names=FALSE)
